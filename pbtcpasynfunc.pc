@@ -1,0 +1,246 @@
+/*
+	filename:pbtcpasynfunc.pc
+  create time: 2012-12-12
+*/
+
+#include "pbforward.h"
+
+
+/*sql*/
+EXEC SQL include pbranchdb.h;
+EXEC SQL INCLUDE SQLCA;
+
+/*declare function*/
+key_t fmipckey_tcp(int id);
+int ftok_tcp(char *path,int id);
+void sig_handle(int signo);
+void catch_sig(void);
+int init_sem(int chnlno, int procnum);
+int get_sem_value(int chnlno, int semno);
+int pv_sem(int chnlno, int sem_num, int sem_op, short  flag);
+int remove_sem(int chnlno);
+int set_deamon(void);
+
+/*extern*/
+extern int get_lock_pos();
+extern int chnlno;
+
+/*implements function*/
+
+/*convert id to key*/
+key_t fmipckey_tcp(int id)
+{
+    static	char	path[ 128 ] ;
+    static	int	flag = 0 ;
+    key_t	key ;
+
+    if(flag == 0)
+    {
+        memset(path,0x00,sizeof(path));
+        sprintf(path,"%s/etc/%s",getenv("HOME"),set_string(.conf));
+        flag = 1;
+    }
+
+    id += 2048;/*为了与原有系统匹配,id+0248*/
+    key = ftok_tcp(path, id);
+    return ( key );
+
+}
+/*生成16进制8位key值，id占前3位，最大FFF，profile节点值占后五位最大FFFFF*/
+int ftok_tcp(char *path,int id)
+{
+
+    key_t ret = 0;
+    long inode = 0;
+    struct stat stat_info;
+
+    if( id < 0 || id > 4096)
+    {
+        WriteLog( ERR_LVL, "ERROR:id[%d]出错 0 < id < 4096",id);
+        return -1;
+    }
+
+    if(0 != stat(path, &stat_info))
+    {
+        WriteLog( ERR_LVL, "ERROR:取得文件信息失败！[%s]",path);
+        return ( -1 );
+    }
+
+    if(stat_info.st_ino < 0 || stat_info.st_ino > 1048575)
+    {
+        inode = stat_info.st_ino % 1048575;   /*fffff最大为1048575  */
+    } else {
+        inode = stat_info.st_ino;
+    }
+
+    ret = ( id * 16 * 16 * 16 *16 * 16)+ inode;
+
+    return ret;
+}
+/*信号处理*/
+void sig_handler(int signo)
+{
+    int	iPid;
+    int	iState;
+    while ((iPid = waitpid(-1, &iState, WNOHANG)) > 0);
+    catch_sig();
+    return;
+}
+/*捕捉信号*/
+void catch_sig()
+{
+    struct sigaction act;
+    sigset_t        zeromask;
+
+    memset(&act, 0, sizeof(struct sigaction));
+    act.sa_handler = sig_handler;
+    sigemptyset(&act.sa_mask);
+    sigaddset(&act.sa_mask, SIGCHLD);
+    act.sa_flags = SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &act, NULL);
+    return;
+}
+/*创建信号量*/
+int init_sem(int chnlno,  int procnum)
+{
+    key_t 		key ;
+    int 			sem_id;
+    int	nsems = 1;/*信号量个数*/
+    ushort 		initarray[ 1 ] = {10} ;/* 信号量初始值*/
+
+    union semun {
+        int val;
+        struct semid_ds *buf;
+        unsigned short *array;
+    } semval;
+
+    memset(&semval,0x00,sizeof(semval));
+    if(procnum > 0) {
+        int i;
+        for(i=0; i<nsems; i++ )
+            initarray[i] = procnum;
+    }
+    semval.array = initarray;
+    key = fmipckey_tcp( chnlno );
+
+    WriteLog( DEBUG_LVL0, "init_sem key[%d] pro_num[%d]", key, procnum);
+    /*清除已存在信号量*/
+    if ( (sem_id = semget(key, 0, IPC_ALLOC)) >= 0 ) {
+        semctl ( sem_id , 0 , IPC_RMID );
+        WriteLog ( ERR_LVL , "sem_id[%d] existed. remove it succeed.",sem_id);
+    }
+    /*创建信号量*/
+    if ( (sem_id = semget(key, nsems, IPC_CREAT|0666)) >=  0 ) {
+        WriteLog ( ERR_LVL , "create sem succeed. semid[%d]",sem_id);
+        if (semctl(sem_id , 0, SETALL, semval) >=  0 ) {
+            WriteLog ( ERR_LVL , "set sem value succeed. sem_id[%d]", sem_id);
+            return( sem_id );
+        }
+    }
+    WriteLog( ERR_LVL , "ERROR:init_sem  key[%d] err[%s]! ", key , strerror( errno ) );
+    return ( -1 );
+}
+/*查询信号量值*/
+int get_sem_value(int chnlno, int semno)
+{
+    int 				sem_id ;
+    key_t key;
+
+    key = fmipckey_tcp( chnlno );
+    if ( ( sem_id = semget( key , 0 , IPC_ALLOC ) ) >= 0 ) {
+        return(semctl(sem_id , semno, GETVAL));
+    }
+    WriteLog ( ERR_LVL ,"ERROR:get_sem_value  key[%d] err[%s]", key , strerror( errno ) );
+    return ( -1 );
+}
+
+/*信号量PV操作*/
+int pv_sem( int chnlno , int sem_num , int sem_op ,short  flag   )
+{
+    key_t key;
+    int					sem_id ;
+    struct sembuf		op_sem[1];
+    char pv[2];
+
+    key = fmipckey_tcp( chnlno );
+    memcpy(pv, (sem_op > 0 ? "V":"P"), 2);
+
+    if ( ( sem_id = semget( key , 0 , IPC_ALLOC ) ) < 0 ) {
+        WriteLog ( ERR_LVL , "key[%d], sem not exist.");
+        return(0);
+    }
+
+    WriteLog ( ERR_LVL , "Before %s_Operation. semid[%d] flag[%d] currsem[%d]",
+               pv, sem_id,  flag,
+               get_sem_value(chnlno, sem_num)  );
+
+    op_sem[0].sem_num = sem_num ;
+    op_sem[0].sem_op  = sem_op ;
+    op_sem[0].sem_flg = flag ;
+
+    if((semop(sem_id , op_sem , 1 ) )<0)
+    {
+        WriteLog(ERR_LVL, "ERROR: OpMux semid[%d] sem_num[%d] sem_op[%s], err[%s]",
+                 sem_id, sem_num, pv, strerror(errno) ) ;
+        return ( -1 ) ;
+    }
+
+    WriteLog ( ERR_LVL , "After %s_Operation. semid[%d] flag[%d] currsem[%d]",
+               pv, sem_id,  flag,
+               get_sem_value(chnlno, sem_num)  );
+
+    return ( 0 );
+}
+/*删除信号量*/
+int remove_sem(int chnlno)
+{
+    int semid;
+    key_t key;
+
+    key = fmipckey_tcp( chnlno );
+
+    if ( (semid= semget(key, 0, IPC_ALLOC)) > 0 ) {
+        if(semctl(semid, 0, IPC_RMID) == 0) { /*成功删除*/
+            WriteLog ( ERR_LVL ,"remove sem succeed. sem_id[%d]", semid);
+            return PB_OK;
+        }
+    }
+    WriteLog ( ERR_LVL ,"ERROR:remove_sem key[%d] err[%s]", key, strerror(errno));
+    return PBFAIL;
+}
+/*设置守护进程*/
+int set_deamon()
+{
+    switch( fork() ) {
+    case -1 :
+        fprintf( stderr , "设置守护进程失败 errno : %d\n" , errno ) ;
+        return PBFAIL ;
+    case 0 :
+        break;
+    default :
+        exit( 0 ) ;
+    }
+
+    umask(0);
+    setsid();
+
+
+    int fd;
+    fd = open("/dev/null", O_RDWR);
+    if (fd == -1)
+        return(-1);
+
+    if (dup2(fd, STDIN_FILENO) == -1)
+        return(-1);
+    if (dup2(fd, STDOUT_FILENO) == -1)
+        return(-1);
+    if (dup2(fd, STDERR_FILENO) == -1)
+        return(-1);
+
+    if ( LockRec( LOCKFILE , get_lock_pos() ) ) {
+        WriteLog ( ERR_LVL, " 网关已启动　!\n" );
+        exit ( 0 );
+    }
+
+}
+

@@ -1,0 +1,265 @@
+/*
+	filename:pbparse.pc
+  create time: 2012-12-12
+*/
+
+#include "pbforward.h"
+
+/*#define debug */  /*print debug info*/
+
+/*sql*/
+EXEC SQL include pbranchdb.h;
+EXEC SQL INCLUDE SQLCA;
+
+
+/*declare function*/
+void list_init(cfg_node_t *list);
+cfg_node_t * list_create_node();
+int list_insert_node(cfg_node_t *list, cfg_node_t *node);
+int  list_get_number(cfg_node_t *list);
+cfg_node_t * list_get_node_value(cfg_node_t *list, int nodeno);
+void list_destory(cfg_node_t *list);
+void parse_file(cfg_node_t *list, char *filename);
+int pb_cfg_init(int nodeno, cfg_info_t *cfg, char *filename);
+void print_node(cfg_node_t *p);
+void list_print(cfg_node_t *list);
+
+/*implements function*/
+
+
+/*init a list*/
+void list_init(cfg_node_t *list)
+{
+    memset(&(list->cfg_info), 0x00, sizeof(cfg_info_t));
+    list->next = NULL;
+    return;
+}
+/*create list node*/
+cfg_node_t * list_create_node()
+{
+    cfg_node_t *p;
+    if ( (p = (cfg_node_t*)malloc( sizeof(cfg_node_t) ) ) == NULL )
+        return(NULL);
+    memset(&(p->cfg_info), 0x00, sizeof(cfg_info_t));
+    p->next = NULL;
+    return(p);
+}
+/*
+**insert a node at rear of list
+**return value : -1(fail) 0(success)
+*/
+int list_insert_node(cfg_node_t *list, cfg_node_t *node)
+{
+    cfg_node_t *p;
+
+    if(!list || !node)
+        return(-1);
+    p = list;
+    while(p->next) {
+        p = p->next;
+    }
+    p->next = node;
+
+    return(0);
+}
+/*get list node number*/
+int  list_get_number(cfg_node_t *list)
+{
+    int c = 0;
+    cfg_node_t *p;
+    p = list;
+    while(p->next) {
+        p = p->next;
+        c++;
+    }
+    return(c);
+}
+/*according to nodeno ,get node value*/
+cfg_node_t * list_get_node_value(cfg_node_t *list, int nodeno)
+{
+
+    cfg_node_t *p;
+    int c =0;
+    if(nodeno > list_get_number(list) ) {
+        return(NULL);
+    }
+    p = list;
+    while(c < nodeno) {
+        p = p->next	;
+        c++;
+    }
+
+    return(p);
+}
+/*parse configure file info, then save into list */
+void parse_file(cfg_node_t *list, char *filename)
+{
+    FILE *fp;
+    char buf[buf_size];/*line buff*/
+    char name[100], value[100];/*para name, para value*/
+    char *p,*namep, *valuep;
+    int nameflg, valueflg;
+
+    cfg_info_t cfg_info;/*configure info*/
+    cfg_node_t *np;/*configure info node pointer*/
+    int rflg = 0, lflg = 0;/*括号标志*/
+
+    if ( ( fp = fopen(filename, "r") ) == NULL) {
+        printf("open file[%s]fail.err:[%s]\n", filename, strerror(errno));
+        return;
+    }
+    /*parse configure file*/
+    while( !feof(fp)) {
+        if ( !fgets(buf, buf_size, fp))/*solving that the last line of file display twice*/
+            break;
+        nameflg = valueflg = 0;
+        p = buf;
+        namep = name;
+        valuep = value;
+
+        /*单独解析一行*/
+        while( *p != '\0') {
+            if(*p == '#')break;
+            if(isspace(*p)) {
+                if(nameflg == 1) valueflg = 1;
+                p++;
+                continue;
+            }
+            if(valueflg == 0)
+                nameflg = 1;
+            else
+                nameflg = 0;
+
+            if(nameflg == 1) *namep++ = *p++;
+            if(valueflg == 1) *valuep++ = *p++;
+        }
+        /*add ending flag of string*/
+        *namep =  '\0';
+        *valuep = '\0';
+
+        if( !strlen(name) ) continue;/*cut off empty line*/
+        if(strchr(name,'{')) lflg = 1;
+        if(strchr(name,'}')) rflg = 1;
+
+        /*according to para name, then set para value*/
+        if( strcmp(name, "chnlno") == 0 ) 		strcpy(cfg_info.chnlno, value);
+        if( strcmp(name, "areano") == 0 ) 		strcpy(cfg_info.areano, value);
+        if( strcmp(name, "hostip") == 0 ) 		strcpy(cfg_info.hostip, value);
+        if( strcmp(name, "srcip") == 0 ) 			strcpy(cfg_info.srcip, value);
+        if( strcmp(name, "srcport") == 0 ) 		cfg_info.srcport =  atoi(value);
+        if( strcmp(name, "destip") == 0 ) 		strcpy(cfg_info.destip, value);
+        if( strcmp(name, "destport") == 0 ) 	cfg_info.destport =  atoi(value);
+        if( strcmp(name, "clientport") == 0 ) cfg_info.clientport =  atoi(value);
+        if( strcmp(name, "serverport") == 0 ) cfg_info.serverport =  atoi(value);
+        if( strcmp(name, "timeout") == 0 ) 		cfg_info.timeout =  atoi(value);
+        if( strcmp(name, "maxproc") == 0 ) 		cfg_info.maxproc =  atoi(value);
+        if( strcmp(name, "ipbind") == 0 ) 		strcpy(cfg_info.ipbind, value);
+        if( strcmp(name, "bindinfo") == 0 ) 	strcpy(cfg_info.bindinfo, value);
+        if( strcmp(name, "maxsize") == 0 ) 		cfg_info.maxsize =  atoi(value);
+        if( strcmp(name, "verify") == 0 ) 		cfg_info.verify =  atoi(value);
+        if( strcmp(name, "msgroute") == 0 ) 	strcpy(cfg_info.msgroute, value);
+        if( strcmp(name, "cert") == 0 ) 			strcpy(cfg_info.cert, value);
+        if( strcmp(name, "key") == 0 ) 				strcpy(cfg_info.key, value);
+        if( strcmp(name, "cacert") == 0 ) 		strcpy(cfg_info.cacert, value);
+        if( strcmp(name, "filetype") == 0 ) 	strcpy(cfg_info.filetype, value);
+        if( strcmp(name, "cipherlist") == 0 ) strcpy(cfg_info.cipherlist, value);
+
+        /*have a correct channel info, add channel info into list*/
+        /*note: an incorrect channel info will not add into list*/
+        if(lflg == 1 && rflg == 1) {
+            lflg = 0;
+            rflg = 0;
+            np = list_create_node();
+            memcpy(&(np->cfg_info), &cfg_info, sizeof(cfg_info_t));
+            list_insert_node(list,np);
+        }
+
+    }
+    fclose(fp);
+    return;
+}
+/*parse configure file ,then save into struct *cfg */
+int pb_cfg_init(int nodeno, cfg_info_t *cfg, char *filename)
+{
+    cfg_node_t head;
+    cfg_node_t *nodeP;
+    int ret = 0;
+
+    list_init(&head);
+    parse_file(&head, filename);
+
+#ifdef debug
+    printf("list info:\n");
+    list_print(&head);
+#endif
+
+    nodeP = list_get_node_value(&head, nodeno);
+    if(nodeP)
+        memcpy(cfg, &(nodeP->cfg_info), sizeof(cfg_info_t));
+    else
+        ret = -1;
+
+#ifdef debug
+    printf("nodeno=%d info:\n",nodeno);
+    print_node(nodeP);
+#endif
+
+    list_destory(&head);
+
+    return ret;
+}
+/*destory list*/
+void list_destory(cfg_node_t *list)
+{
+    cfg_node_t *p,*q;
+    p = list->next;
+    while(p!=NULL)
+    {
+        q = p->next;
+        free(p);
+        p = q;
+    }
+
+    list->next = NULL;
+    return;
+}
+/*print node*/
+void print_node(cfg_node_t *p)
+{
+    printf("-->addres of p is 0x%p\n", p);
+    printf("chnlno=%s\n", p->cfg_info.chnlno);
+    printf("areano=%s\n", p->cfg_info.areano);
+    printf("srcip=%s\n", p->cfg_info.srcip);
+    printf("srcport=%d\n", p->cfg_info.srcport);
+    printf("destip=%s\n", p->cfg_info.destip);
+    printf("destport=%d\n", p->cfg_info.destport);
+    printf("clientport=%d\n", p->cfg_info.clientport);
+    printf("serverport=%d\n", p->cfg_info.serverport);
+    printf("timeout=%d\n", p->cfg_info.timeout);
+    printf("maxproc=%d\n", p->cfg_info.maxproc);
+    printf("ipbind=%s\n", p->cfg_info.ipbind);
+    printf("bindinfo=%s\n", p->cfg_info.bindinfo);
+    printf("maxsize=%d\n", p->cfg_info.maxsize);
+    printf("verify=%d\n", p->cfg_info.verify);
+    printf("msgroute=%s\n", p->cfg_info.msgroute);
+    printf("cert=%s\n", p->cfg_info.cert);
+    printf("key=%s\n", p->cfg_info.key);
+    printf("cacert=%s\n", p->cfg_info.cacert);
+    printf("filetype=%s\n", p->cfg_info.filetype);
+    printf("cipherlist=%s\n", p->cfg_info.cipherlist);
+    printf("\n");
+    return;
+}
+
+/*print list*/
+void list_print(cfg_node_t *list)
+{
+    cfg_node_t *p;
+    p = list;
+    while(p->next) {
+        print_node(p->next);
+        p = p->next;
+    }
+
+    return;
+}

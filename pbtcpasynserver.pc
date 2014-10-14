@@ -1,0 +1,253 @@
+/*
+	filename:pbtcpasynserver.pc
+  create time: 2012-12-12
+*/
+
+#include "pbforward.h"
+
+
+/*sql*/
+EXEC SQL include pbranchdb.h;
+EXEC SQL INCLUDE SQLCA;
+
+
+/*globe var*/
+cfg_info_t cinfo;/*configre info var*/
+int chnlno;
+/*declare*/
+int tcp_asyn_server(int argc, char *argv[]);
+int listen_accept(cfg_info_t *cfgctx);
+int recmsg_deliver(int listenfd, int sockfd, cfg_info_t *cfgctx);
+int tcp_asyn_recvmsg(int sockfd, char *recv_buf, int bufsize, int timeout);
+int tcp_asyn_deliver(char *recv_buf, int bufsize, cfg_info_t *cfgctx);
+int get_lock_pos();/*return record lock pos of process */
+
+/*implements*/
+int main(int argc, char *argv[])
+{
+    tcp_asyn_server(argc, argv);
+    return 0;
+}
+
+int tcp_asyn_server(int argc, char *argv[])
+{
+    int             ret;
+
+    if ( argc == 2 ) { /*正确参数格式*/
+        char filename[200];
+        sprintf(filename, "%s/etc/%s", getenv("HOME"), set_string(.conf));
+        pb_cfg_init( atoi(argv[1]), &cinfo, filename);
+    } else { /*错误参数则返回*/
+        return(0);
+    }
+
+    memset(logfile, 0x00, sizeof(logfile));
+    sprintf(logfile, "%s%s", set_string(server), cinfo.chnlno);
+    pbsetlog(atoi(getenv("LOGLVL")));
+
+    chnlno = atoi(cinfo.chnlno) + 1024;/*chnlno 赋值必须放在set_deamon之前*/
+
+    set_deamon();   /*设置deamon进程*/
+    catch_sig();    /*捕捉信号*/
+
+    if( init_sem( chnlno, cinfo.maxproc) == PBFAIL )
+        return PB_ERR ;
+
+    /*Main Loop*/
+    WriteLog(DEBUG_LVL0, "%s 独立网关处理函数开始运行", logfile);
+    ret = listen_accept(&cinfo);
+    if (ret < 0) {
+        WriteLog(ERR_LVL, "%s server have been failed.", logfile);
+        ret = PBFAIL;
+    } else {
+        WriteLog(ERR_LVL, "%s server have been ended.", logfile);
+        ret = PB_OK;
+    }
+
+    /*release semphore*/
+    remove_sem( chnlno );
+    UnlockRec(LOCKFILE , get_lock_pos() );
+
+    return ret;
+}
+
+int listen_accept(cfg_info_t *cfgctx)
+{
+    int             ret = 0;
+    unsigned long   CliLen;
+    int             newsockfd, listenfd;
+    char            buffer[msg_buf_size + 1];
+    struct sockaddr_in Cli_Addr;
+    fd_set					rfd_set;
+    int 						err_flag = 0;
+    char 						*str;
+
+    memset(buffer, 0x00, sizeof(buffer));
+    CliLen = sizeof(Cli_Addr);
+    listenfd = serv_init(cfgctx->serverport);
+    if(listenfd == PB_ERR) {
+        WriteLog(ERR_LVL, "serv_init() failed !!");
+        return PBFAIL;
+    }
+
+    while (1) {
+        err_flag = 0;
+        FD_ZERO(&rfd_set);
+        FD_SET(listenfd, &rfd_set);
+        WriteLog(DEBUG_LVL0, "parent process select before");
+        catch_sig();
+
+        switch(select(listenfd + 1, &rfd_set, NULL, NULL, NULL)) {
+        case -1:
+            if (errno != EINTR) {
+                WriteLog(ERR_LVL, "select() failed !! errno:[%d]", errno);
+                close(listenfd);
+                return -1;
+            }
+            err_flag = 1;
+            break;
+
+        case 0:
+            WriteLog(ERR_LVL, "case = 0 errno:[%d]", errno);
+            err_flag = 1;
+            break;
+
+        default:
+            if(FD_ISSET(listenfd, &rfd_set)) {
+                WriteLog(DEBUG_LVL0, "accept before");
+                newsockfd = accept(listenfd, (struct sockaddr *) & Cli_Addr, ( socklen_t *)&CliLen);
+                if (newsockfd < 0) {
+                    WriteLog(ERR_LVL, "Accept newsockfd failed newsockfd =[%d]  ", newsockfd);
+                    if (errno == EINTR) {
+                        WriteLog(ERR_LVL, "accept EINTR");
+                    }
+                    err_flag = 1;
+                }
+            }
+            break;
+        }
+        if(err_flag)	continue;
+
+        recmsg_deliver(listenfd, newsockfd, cfgctx);
+        TCPClose(newsockfd);
+    }
+    close(listenfd);
+    return PB_OK;
+}
+
+int recmsg_deliver(int listenfd, int sockfd, cfg_info_t *cfgctx)
+{
+    int             ret, rec = 0;
+    int             value;
+    char            timestr[20];
+    long            time1, time2;
+    char            recv_buf[msg_buf_size + 1];
+    int 						timeouts;
+    int	semno = 0;/*信号量集合中序号*/
+
+
+    memset(timestr, 0x00, sizeof(timestr));
+    memset(recv_buf,0x00, sizeof(recv_buf));
+
+    timeouts = cfgctx->timeout;
+
+    while (1) {
+        if ((value = get_sem_value( chnlno, semno)) < 0) {
+            WriteLog(ERR_LVL, "获取信号量失败 ERROR[%s]\n", strerror(errno));
+            return (PBFAIL);
+        }
+        if (value <= 0) {
+            WriteLog(ERR_LVL, "信号量[%d]不能满足需要，继续等待******************\n", value);
+            MTimeOuts(wait_time * 100);
+            continue;
+        } else
+            break;
+    }
+    WriteLog(DEBUG_LVL0, "当前可用信号量为[%d]，生成处理子进程***************\n", value);
+
+    rec = fork();
+    if (rec < 0) {
+        WriteLog(ERR_LVL, "Warning Fork process failed!");
+    }
+    if (rec == 0) {/*子进程 异步短连接*/
+        close(listenfd);
+
+        pv_sem(chnlno, semno, -1, SEM_UNDO);
+
+        time1 = GetMillTime(timestr);
+        WriteLog(DEBUG_LVL0, "子进程处理开始时间[%ld]", time1);
+        WriteLog(DEBUG_LVL0, "Sub Process Req from Services");
+
+        WriteLog(DEBUG_LVL0, "reading");
+        /*recv data*/
+        ret = tcp_asyn_recvmsg(sockfd, recv_buf, msg_buf_size, timeouts);
+        if(ret <= 0) {
+            WriteLog(ERR_LVL, "ERROR[%d]:读取失败!", errno);
+            TCPClose(sockfd);
+            pv_sem( chnlno , semno, +1 , SEM_UNDO );
+            exit(PBFAIL);
+        }
+        WriteHexLog(DEBUG_LVL0, recv_buf, ret);
+        WriteLog(DEBUG_LVL0, "recv_buf: \n%s\n", recv_buf);
+        /*close sockfd when recv data finished*/
+        TCPClose(sockfd);
+
+        /*tcp asyn term deliver data*/
+        value = tcp_asyn_deliver(recv_buf, ret, cfgctx);
+        if(value == PBFAIL) {
+            WriteLog(ERR_LVL, "转发数据包失败");
+            sprintf(recv_buf, "HTTP/1.1 500 error\r\nContent-Length: 0\r\n\r\n");
+            value = strlen(recv_buf);
+        }
+
+        time2 = GetMillTime(timestr);
+        WriteLog(DEBUG_LVL0, "子进程处理结束时间[%ld]", time2);
+        WriteLog(DEBUG_LVL0, "子进程处理时间差[%ld]", time2 - time1);
+
+        pv_sem(chnlno, semno, +1, SEM_UNDO);
+        exit(PB_OK);
+    }
+
+    return (PB_OK);
+}
+
+int tcp_asyn_recvmsg(int sockfd, char *recv_buf, int bufsize, int timeouts)
+{
+    return( TCP_SYNC_Read(sockfd, recv_buf, bufsize, timeouts) );
+}
+
+int tcp_asyn_deliver(char *recv_buf, int bufsize, cfg_info_t *cfgctx)
+{
+    int 	sockfd;
+    int ret;
+
+    if ( memcmp(cfgctx->ipbind, "yes", 4)  == 0 ) {/*绑定*/
+        WriteLog(DEBUG_LVL0,"发送ip[%s]端口[%d]对应绑定信息[%s]",cfgctx->srcip, cfgctx->srcport, cfgctx->bindinfo );
+        sockfd = TCPConnectBind(cfgctx->srcip, cfgctx->srcport, cfgctx->bindinfo);
+    } else {/*不绑定*/
+        sockfd = TCPConnect(cfgctx->srcip, cfgctx->srcport, 0);
+    }
+
+    if (sockfd == -1) {
+        WriteLog(ERR_LVL, "connect inner %s gate err![%s]", logfile, strerror(errno));
+        return -1;
+    }
+
+    ret = TCPWrite(sockfd, recv_buf, bufsize);
+    if(ret == bufsize) {
+        WriteLog(DEBUG_LVL0, "发送成功ret=[%d] buffsize=[%d]", ret,bufsize);
+    } else {
+        WriteLog(DEBUG_LVL0, "发送失败ret=[%d] buffsize=[%d]", ret,bufsize);
+        TCPClose(sockfd);
+        return -1;
+    }
+
+    TCPClose(sockfd);
+    return ret;
+}
+/*return file lock position*/
+int get_lock_pos()
+{
+    WriteLog(DEBUG_LVL0, "当前记录锁位置[%d]", chnlno);
+    return( chnlno );
+}
